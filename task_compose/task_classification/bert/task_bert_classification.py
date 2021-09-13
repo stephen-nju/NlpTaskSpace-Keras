@@ -13,23 +13,25 @@ import argparse
 import csv
 import itertools
 import os
-import pickle
-import pprint
-from typing import Dict, List, Tuple
 import numpy as np
 import tensorflow as tf
-from bert4keras.snippets import sequence_padding, convert_to_unicode
+from core.snippets import sequence_padding, convert_to_unicode
 from keras.utils import to_categorical
 from keras.utils.data_utils import Sequence
-
+from tensorflow_core.python.keras.callbacks import TensorBoard
 from core.modeling.modeling_bert_classification import Bert4Classification
-from keras.callbacks import (Callback, EarlyStopping, ModelCheckpoint,
-                             TensorBoard)
+from keras.callbacks import (Callback, EarlyStopping, ModelCheckpoint)
 from sklearn.metrics import classification_report as sk_classification_report
 from sklearn.metrics import precision_score, recall_score, f1_score
 from sklearn.preprocessing import LabelEncoder
 from tokenizers.implementations import BertWordPieceTokenizer
 from tokenizers.processors import TemplateProcessing
+
+from keras.models import load_model
+from sklearn.metrics.pairwise import cosine_similarity
+
+# 关闭eager模式
+tf.disable_eager_execution()
 
 
 class InputExample(object):
@@ -67,19 +69,16 @@ class InputFeatures(object):
         self.is_real_example = is_real_example
 
 
-class ClassificationProcessor(object):
+class DataProcessorFunction(object):
 
-    def __init__(self, tokenizer):
+    def __init__(self):
         self.language = "zh"
-        self.tokenizer = tokenizer
 
     def get_train_examples(self, data_path):
         """See base class."""
         lines = self._read_tsv(data_path)
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "train-%d" % (i)
             text_a = convert_to_unicode(line[0])
             text_b = convert_to_unicode(line[1])
@@ -91,20 +90,15 @@ class ClassificationProcessor(object):
     def get_test_examples(self, data_path):
         pass
 
-    def get_dev_examples(self, data_dir):
+    def get_dev_examples(self, data_path):
         """See base class."""
-        lines = self._read_tsv(os.path.join(data_dir, "xnli.dev.tsv"))
+        lines = self._read_tsv(data_path)
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "dev-%d" % (i)
-            language = convert_to_unicode(line[0])
-            if language != convert_to_unicode(self.language):
-                continue
-            text_a = convert_to_unicode(line[6])
-            text_b = convert_to_unicode(line[7])
-            label = convert_to_unicode(line[1])
+            text_a = convert_to_unicode(line[0])
+            text_b = convert_to_unicode(line[1])
+            label = convert_to_unicode(line[2])
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
@@ -115,24 +109,16 @@ class ClassificationProcessor(object):
 
     @classmethod
     def _read_tsv(cls, input_file, quotechar=None):
-        """Reads a tab separated value file."""
         with tf.gfile.Open(input_file, "r") as f:
             reader = csv.reader(f, delimiter="\t", quotechar=quotechar)
             lines = []
             for line in reader:
-                lines.append(line)
+                if float(line[-1]) == 0:
+                    lines.append([line[0], line[1], "negative"])
+                else:
+
+                    lines.append([line[0], line[1], "positive"])
             return lines
-
-    def batch_transform(self, features, num_classes):
-        batch_token_ids, batch_segment_ids, batch_labels = [], [], []
-        for features in features:
-            batch_token_ids.append(features.input_ids)
-            batch_segment_ids.append(features.segment_ids)
-            batch_labels.append(features.label_id)
-
-        batch_token_ids = sequence_padding(batch_token_ids, value=self.tokenizer.token_to_id("[PAD]"))
-        batch_segment_ids = sequence_padding(batch_segment_ids)
-        return [batch_token_ids, batch_segment_ids], to_categorical(np.array(batch_labels), num_classes=num_classes)
 
     @staticmethod
     def convert_single_example(example, tokenizer, label_encode):
@@ -149,34 +135,46 @@ class ClassificationProcessor(object):
             is_real_example=True)
         return feature
 
-    def convert_examples_features(self, examples, label_encode):
+    def convert_examples_to_features(self, examples, tokenizer, label_encode):
         features = []
         # 这里可以采用多线程等方式提高预处理速度
         for example in examples:
-            feature = self.convert_single_example(example=example, tokenizer=self.tokenizer, label_encode=label_encode)
+            feature = self.convert_single_example(example=example, tokenizer=tokenizer, label_encode=label_encode)
             features.append(feature)
 
         return features
 
 
-class ClassificationSequence(Sequence):
-    def __init__(self, features, processor, num_classes, batch_size):
+class DataSequence(Sequence):
+    def __init__(self, features, token_pad_id, num_classes, batch_size):
         self.batch_size = batch_size
         self.features = features
-        self.processor = processor
+        self.token_pad_id = token_pad_id
         self.num_classes = num_classes
 
     def __len__(self):
         return int(np.ceil(len(self.features) / float(self.batch_size)))
 
-    def __getitem__(self, idx):
-        data = self.features[idx * self.batch_size:(idx + 1) * self.batch_size]
-        return self.processor.batch_transform(data, num_classes=self.num_classes)
+    def __getitem__(self, index):
+        data = self.features[index * self.batch_size:(index + 1) * self.batch_size]
+        return self.feature_batch_transform(data)
+
+    def feature_batch_transform(self, features):
+        batch_token_ids, batch_segment_ids, batch_labels = [], [], []
+        for features in features:
+            batch_token_ids.append(features.input_ids)
+            batch_segment_ids.append(features.segment_ids)
+            batch_labels.append(features.label_id)
+
+        batch_token_ids = sequence_padding(batch_token_ids, value=self.token_pad_id)
+        batch_segment_ids = sequence_padding(batch_segment_ids)
+        return [batch_token_ids, batch_segment_ids], to_categorical(np.array(batch_labels),
+                                                                    num_classes=self.num_classes)
 
 
-class ClassificationCallBack(Callback):
+class ClassificationReporter(Callback):
     def __init__(self, validation_data):
-        super(ClassificationCallBack, self).__init__()
+        super(ClassificationReporter, self).__init__()
         self.validation_data = validation_data
 
     def on_train_begin(self, logs={}):
@@ -189,6 +187,7 @@ class ClassificationCallBack(Callback):
         val_true = []
         for (x_val, y_val) in self.validation_data:
             val_pred_batch = self.model.predict_on_batch(x_val)
+            # 这里可以设置不同的阈值进行验证
             val_pred_batch = np.argmax(np.asarray(val_pred_batch).round(), axis=1)
             val_pred.append(val_pred_batch)
             val_true.append(np.argmax(np.asarray(y_val).round(), axis=1))
@@ -206,60 +205,6 @@ class ClassificationCallBack(Callback):
         return
 
 
-class TaskBertClassification:
-    def __init__(self, args):
-        self.args = args
-        self.tokenizer = BertWordPieceTokenizer(os.path.join(self.args.bert_model_path, "vocab.txt"), pad_token="[PAD]")
-        self.tokenizer.post_processor = TemplateProcessing(
-            single="[CLS] $A [SEP]",
-            pair="[CLS] $A [SEP] $B:1 [SEP]:1",
-            special_tokens=[
-                ("[CLS]", self.tokenizer.token_to_id("[CLS]")),
-                ("[SEP]", self.tokenizer.token_to_id("[SEP]")),
-            ],
-        )
-        if not os.path.exists(self.args.output_root):
-            os.mkdir(self.args.output_root)
-        self.label_encode = LabelEncoder()
-
-    @staticmethod
-    def build_model(args, word_dict, nums_class):
-        bert = Bert4Classification(args=args, word_dict=word_dict, nums_class=nums_class)
-        model = bert.build_model()
-        return model
-
-    def train(self):
-        word_dict = self.tokenizer.get_vocab()
-        self.tokenizer.enable_truncation(max_length=self.args.max_length)
-        processor = ClassificationProcessor(tokenizer=self.tokenizer)
-        labels = processor.get_labels()
-        self.label_encode.fit(labels)
-        train_examples = processor.get_train_examples(self.args.train_data)
-        train_features = processor.convert_examples_features(train_examples, label_encode=self.label_encode)
-        train_sequence = ClassificationSequence(train_features,
-                                                processor=processor,
-                                                num_classes=len(self.label_encode.classes_),
-                                                batch_size=self.args.batch_size)
-        # for data in train_sequence:
-        #     print(data)
-        # call_backs = []
-        # tensor_board = TensorBoard(log_dir="./logs", write_graph=False)
-        # call_backs.append(tensor_board)
-        # checkpoint = ModelCheckpoint('bert_cls_best.hdf5', monitor='val_acc', verbose=2, save_best_only=True,
-        #                              mode='max',
-        #                              save_weights_only=True)
-        # call_backs.append(checkpoint)
-        # early_stop = EarlyStopping('val_acc', patience=4, mode='max', verbose=2, restore_best_weights=True)
-        # call_backs.append(early_stop)
-        #
-        model = self.build_model(self.args, word_dict, len(labels))
-        model.fit(train_sequence,
-                  steps_per_epoch=len(train_sequence),
-                  epochs=self.args.epochs,
-                  use_multiprocessing=True
-                  )
-
-
 if __name__ == "__main__":
     parse = argparse.ArgumentParser()
     parse.add_argument("--output_root", type=str, default="output", help="output dir")
@@ -272,8 +217,68 @@ if __name__ == "__main__":
     parse.add_argument("--lr", type=float, default=1e-5)
     parse.add_argument("--batch_size", type=int, default=4, help="batch size")
     parse.add_argument("--max-length", type=int, default=128, help="max sequence length")
-
     parse.add_argument("-epochs", type=int, default=10, help="number of training epoch")
+    # 参数配置
     args = parse.parse_args()
-    task = TaskBertClassification(args=args)
-    task.train()
+    # tokenizer
+    tokenizer = BertWordPieceTokenizer(os.path.join(args.bert_model_path, "vocab.txt"), pad_token="[PAD]")
+    tokenizer.enable_truncation(max_length=args.max_length)
+    tokenizer.post_processor = TemplateProcessing(
+        single="[CLS] $A [SEP]",
+        pair="[CLS] $A [SEP] $B:1 [SEP]:1",
+        special_tokens=[
+            ("[CLS]", tokenizer.token_to_id("[CLS]")),
+            ("[SEP]", tokenizer.token_to_id("[SEP]")),
+        ],
+    )
+    if not os.path.exists(args.output_root):
+        os.mkdir(args.output_root)
+    label_encode = LabelEncoder()
+    # 模型
+    bert = Bert4Classification(args=args, nums_class=len(label_encode.classes_))
+    model = bert.build_model()
+    word_dict = tokenizer.get_vocab()
+    tokenizer.enable_truncation(max_length=args.max_length)
+    processor = DataProcessorFunction()
+    # 设置类别标签
+    labels = processor.get_labels()
+    label_encode.fit(labels)
+    train_examples = processor.get_train_examples(args.train_data)
+    train_features = processor.convert_examples_to_features(train_examples,
+                                                            tokenizer=tokenizer,
+                                                            label_encode=label_encode)
+    train_sequence = DataSequence(train_features,
+                                  token_pad_id=tokenizer.token_to_id("[PAD]"),
+                                  num_classes=len(label_encode.classes_),
+                                  batch_size=args.batch_size)
+    # 加载验证集数据
+    dev_examples = processor.get_dev_examples(args.dev_data)
+    dev_features = processor.convert_examples_to_features(dev_examples,
+                                                          tokenizer=tokenizer,
+                                                          label_encode=label_encode)
+    dev_sequence = DataSequence(dev_features,
+                                token_pad_id=tokenizer.token_to_id("[PAD]"),
+                                num_classes=len(label_encode.classes_),
+                                batch_size=args.batch_size)
+    call_backs = []
+    classification_report = ClassificationReporter(dev_sequence)
+    call_backs.append(classification_report)
+    tensor_board = TensorBoard(log_dir="./logs", write_graph=False)
+    call_backs.append(tensor_board)
+    checkpoint = ModelCheckpoint('bert_cls_best.hdf5', monitor='accuracy', verbose=2, save_best_only=True,
+                                 mode='max',
+                                 save_weights_only=True)
+    call_backs.append(checkpoint)
+    early_stop = EarlyStopping('accuracy', patience=4, mode='max', verbose=2, restore_best_weights=True)
+    call_backs.append(early_stop)
+
+    model.fit(train_sequence,
+              validation_data=dev_sequence,
+              steps_per_epoch=len(train_sequence),
+              epochs=args.epochs,
+              use_multiprocessing=True,
+              # train_sequence注意使用可序列化的对象
+              callbacks=call_backs,
+              # 设置分类权重
+              class_weight={0: 1, 1: 1.5},
+              )

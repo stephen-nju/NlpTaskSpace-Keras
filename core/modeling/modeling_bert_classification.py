@@ -7,18 +7,17 @@
 @time: 2021/1/26 10:34
 """
 import os
-from bert4keras.layers import *
-from bert4keras.models import build_transformer_model
-from bert4keras.optimizers import Adam
+from core.layers import *
+from core.models import build_transformer_model
+# from core.optimizers import Adam
 from keras.models import Model
-from keras.metrics import Recall,Precision,Accuracy
+from keras.optimizers import Adam
 
 
 class Bert4Classification(object):
-    def __init__(self, args, word_dict, nums_class):
+    def __init__(self, args, nums_class):
         self.args = args
         # 模型结构参数
-        self.word_dict = word_dict
         self.nums_class = nums_class
         # 字典
 
@@ -39,6 +38,6 @@ class Bert4Classification(object):
             new_model = Model(model.input, output)
             new_model.compile(loss='categorical_crossentropy',
                               optimizer=Adam(self.args.lr),
-                              metrics=['accuracy', keras.metrics.Precision()]
+                              metrics=['accuracy', keras.metrics.Precision(), keras.metrics.Recall()]
                               )
             return new_model
